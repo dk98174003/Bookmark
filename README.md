@@ -2,6 +2,8 @@
 
 A lightweight Python/Tkinter application for organizing, launching and tracking bookmarks (websites, files or commands).
 
+<img width="785" height="97" alt="billede" src="https://github.com/user-attachments/assets/ec4761f1-0b8e-42d8-b4f6-721535905679" />
+
 ## Description
 
 Bookmark Manager allows you to:
