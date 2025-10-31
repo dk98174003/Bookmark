@@ -81,4 +81,3 @@ Have fun
 
 Knud ;O)
 
-If you like, I can generate a **full code file** (e.g., `README.md`) ready to drop into your repository, with placeholders you can fill in. Would you like that?
