@@ -26,6 +26,8 @@ Bookmark Manager allows you to:
 * Usage log (e.g., last launched timestamp, launch count)
 * Easy drag-and-drop interface for rearranging bookmarks
 * Simple, clear UI built with Tkinter
+ 
+<img width="783" height="253" alt="billede" src="https://github.com/user-attachments/assets/5ae1c6f4-17fd-4852-b581-bcf2c78d0ad2" />
 
 ## Installation (Windows)
 
