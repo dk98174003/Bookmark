@@ -2,7 +2,8 @@
 
 A lightweight Python/Tkinter application for organizing, launching and tracking bookmarks (websites, files or commands).
 
-<img width="785" height="97" alt="billede" src="https://github.com/user-attachments/assets/ec4761f1-0b8e-42d8-b4f6-721535905679" />
+<img width="742" height="128" alt="image" src="https://github.com/user-attachments/assets/08cefef6-896f-4a71-9e0e-bb650611e830" />
+
 
 ## Description
 
