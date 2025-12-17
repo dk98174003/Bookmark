@@ -189,18 +189,21 @@ class AppPaths:
     bookmarks_file: Path
     usage_file: Path
     geometry_file: Path
+    theme_file: Path
     icon_path: Path
 
 
 class BookmarkApp:
     def __init__(self) -> None:
         self.paths = self._init_paths()
+        self.theme_mode: str = self.load_theme() or "light"
         self.sort_mode: str = "usage"
 
         self.bookmarks: JsonDict = {}
         self.usage: JsonDict = {}
 
         self.root = tk.Tk()
+        self.root.withdraw()  # prevent flicker and WM geometry nudges on startup
         self.root.title("Bookmarks Manager")
         self._apply_geometry()
 
@@ -213,6 +216,14 @@ class BookmarkApp:
         self.sort_menu = Menu(self.menu, tearoff=0)
         self.context_menu = Menu(self.root, tearoff=0)
 
+        # Theme
+        self.theme_var = tk.BooleanVar(self.root, value=(self.theme_mode == "dark"))
+        self.style = ttk.Style(self.root)
+        try:
+            self._ttk_theme_default = self.style.theme_use()
+        except Exception:
+            self._ttk_theme_default = None
+
         self.browser_var = StringVar(self.root, value="LastUsed")
         self.search_var = StringVar()
 
@@ -221,11 +232,17 @@ class BookmarkApp:
         self.suggestion_listbox: Optional[tk.Listbox] = None
 
         self._build_ui()
+        self._apply_theme()
         self._load_data()
         self.update_menu()
 
         self.root.bind("<Button-3>", self._show_context_menu)
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+
+        # Show the window only after UI + theme is ready (reduces flicker)
+        self.root.update_idletasks()
+        self.root.deiconify()
+        self._schedule_geometry_stabilization()
 
     def _init_paths(self) -> AppPaths:
         data_dir = get_data_dir()
@@ -235,6 +252,7 @@ class BookmarkApp:
             bookmarks_file=data_dir / "bookmarks.json",
             usage_file=data_dir / "usage.json",
             geometry_file=data_dir / "window_geometry.txt",
+            theme_file=data_dir / "ui_theme.txt",
             icon_path=project_dir / "it4home.ico",
         )
 
@@ -247,11 +265,106 @@ class BookmarkApp:
 
     def _apply_geometry(self) -> None:
         geom = self.load_geometry()
+        self._desired_geometry = geom or None
+
         if geom:
             self.root.geometry(geom)
         else:
             self.root.geometry("600x200")
+
         self.root.minsize(600, 40)
+
+    def _stabilize_geometry(self) -> None:
+        """Re-apply saved geometry after the WM maps the window.
+
+        Some Linux window managers (and Wayland/X11 combinations) can nudge the
+        window by a couple of pixels when restoring geometry.
+        """
+        geom = getattr(self, "_desired_geometry", None)
+        if not geom:
+            return
+        try:
+            self.root.update_idletasks()
+            self.root.geometry(geom)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _parse_geometry(geom: str) -> tuple[int, int, int, int] | None:
+        """Parse 'WxH+X+Y' (and variants with -X/-Y) into ints."""
+        m = re.match(r"^(\d+)x(\d+)([+-]\d+)([+-]\d+)$", geom.strip())
+        if not m:
+            return None
+        w = int(m.group(1))
+        h = int(m.group(2))
+        x = int(m.group(3))
+        y = int(m.group(4))
+        return w, h, x, y
+
+    def _on_first_configure(self, event: tk.Event | None = None) -> None:
+        """One-time hook to counter small WM 'nudge' after first map.
+
+        Some WMs adjust the final position after mapping. We re-apply the saved
+        geometry once more a bit later, but only if the delta is tiny (1-5px).
+        """
+        if getattr(self, "_did_first_configure_fix", False):
+            return
+        self._did_first_configure_fix = True
+        # remove the binding so we only schedule once
+        try:
+            bind_id = getattr(self, "_configure_bind_id", None)
+            if bind_id:
+                self.root.unbind("<Configure>", bind_id)
+                self._configure_bind_id = None
+        except Exception:
+            pass
+        # wait a bit longer than the initial stabilization so the WM has settled
+        self.root.after(250, self._final_geometry_fix)
+
+    def _final_geometry_fix(self) -> None:
+        desired = getattr(self, "_desired_geometry", None)
+        if not desired:
+            return
+
+        cur = self.root.wm_geometry()
+        d = self._parse_geometry(desired)
+        c = self._parse_geometry(cur)
+        if not d or not c:
+            # best effort: just re-apply once
+            try:
+                self.root.geometry(desired)
+                self.root.after(120, lambda: self.root.geometry(desired))
+            except Exception:
+                pass
+            return
+
+        dw, dh, dx, dy = d
+        cw, ch, cx, cy = c
+
+        # Only correct tiny shifts; don't fight the user's position.
+        if abs(cx - dx) <= 5 and abs(cy - dy) <= 5 and cw == dw and ch == dh and (cy != dy):
+            try:
+                self.root.geometry(desired)
+                self.root.after(120, lambda: self.root.geometry(desired))
+            except Exception:
+                pass
+
+    def _schedule_geometry_stabilization(self) -> None:
+        if getattr(self, "_desired_geometry", None):
+            # Apply immediately once (best effort), then a few more times after
+            # the window is mapped to counter tiny WM nudges (eg. 1-2 px).
+            self._stabilize_geometry()
+            self.root.after(0, self._stabilize_geometry)
+            self.root.after(120, self._stabilize_geometry)
+            self.root.after(350, self._stabilize_geometry)
+
+            # One-time <Configure> hook: if the WM shifts the window right after
+            # mapping, correct it once more (but only for tiny deltas).
+            try:
+                self._did_first_configure_fix = False
+                self._configure_bind_id = self.root.bind("<Configure>", self._on_first_configure, add="+")
+            except Exception:
+                pass
 
     def _build_ui(self) -> None:
         # Tools
@@ -260,6 +373,9 @@ class BookmarkApp:
         self.extra_menu.add_separator()
         self.extra_menu.add_command(label="Manage Bookmarks", command=self.manage_bookmarks_window)
         self.extra_menu.add_command(label="Usage Stats", command=self.show_usage_stats)
+
+        self.extra_menu.add_separator()
+        self.extra_menu.add_checkbutton(label="Dark mode", variable=self.theme_var, command=self.toggle_theme)
 
         # Sort
         self.sort_menu.add_command(label="Sort by Usage", command=lambda: self.set_sort_mode("usage"))
@@ -332,6 +448,221 @@ class BookmarkApp:
             atomic_write_text(self.paths.geometry_file, geometry, encoding="utf-8")
         except Exception:
             pass
+
+
+    # -------------------------
+    # Theme (light/dark)
+    # -------------------------
+
+    def load_theme(self) -> Optional[str]:
+        if not self.paths.theme_file.exists():
+            return None
+        try:
+            val = self.paths.theme_file.read_text(encoding="utf-8").strip().lower()
+            if val in ("dark", "light"):
+                return val
+        except Exception:
+            pass
+        return None
+
+    def save_theme(self, mode: str) -> None:
+        try:
+            atomic_write_text(self.paths.theme_file, mode, encoding="utf-8")
+        except Exception:
+            pass
+
+    def toggle_theme(self) -> None:
+        self.theme_mode = "dark" if bool(self.theme_var.get()) else "light"
+        self.save_theme(self.theme_mode)
+        self._apply_theme()
+
+    def _apply_theme(self) -> None:
+        theme = self._get_theme_palette()
+        try:
+            self.root.configure(bg=theme["bg"])
+        except Exception:
+            pass
+
+        self._style_menu(self.menu, theme)
+        self._style_menu(self.extra_menu, theme)
+        self._style_menu(self.sort_menu, theme)
+        self._style_menu(self.context_menu, theme)
+
+        self._apply_theme_recursive(self.root, theme)
+        self._style_ttk(theme)
+
+    def _get_theme_palette(self) -> Dict[str, str]:
+        if self.theme_mode == "dark":
+            return {
+                "bg": "#2b2b2b",
+                "fg": "#e6e6e6",
+                "muted_fg": "#b0b0b0",
+                "entry_bg": "#3c3f41",
+                "entry_fg": "#ffffff",
+                "list_bg": "#3c3f41",
+                "list_fg": "#ffffff",
+                "select_bg": "#5c5c5c",
+                "select_fg": "#ffffff",
+                "button_bg": "#3c3f41",
+                "button_fg": "#ffffff",
+            }
+        return {
+            "bg": "#ffffff",
+            "fg": "#000000",
+            "muted_fg": "#666666",
+            "entry_bg": "#ffffff",
+            "entry_fg": "#000000",
+            "list_bg": "#ffffff",
+            "list_fg": "#000000",
+            "select_bg": "#cfe8ff",
+            "select_fg": "#000000",
+            "button_bg": "#f0f0f0",
+            "button_fg": "#000000",
+        }
+
+    def _apply_theme_recursive(self, widget: tk.Misc, theme: Dict[str, str]) -> None:
+        for child in widget.winfo_children():
+            self._style_widget(child, theme)
+            self._apply_theme_recursive(child, theme)
+
+    def _style_widget(self, w: tk.Misc, theme: Dict[str, str]) -> None:
+        # Containers
+        if isinstance(w, (tk.Tk, tk.Toplevel, tk.Frame, tk.LabelFrame, tk.Canvas)):
+            try:
+                w.configure(bg=theme["bg"])
+            except Exception:
+                pass
+
+        # Labels
+        if isinstance(w, tk.Label):
+            try:
+                fg_raw = w.cget("fg")
+                fg_norm = str(fg_raw).strip().lower()
+
+                # Preserve explicit "muted" labels
+                if fg_norm in ("gray", "grey"):
+                    fg_use = theme["muted_fg"]
+                else:
+                    # Fix common case: label kept the default black fg when switching to dark mode
+                    if self.theme_mode == "dark" and fg_norm in ("black", "#000000", "systemwindowtext", "windowtext", "systemtext"):
+                        fg_use = theme["fg"]
+                    # ...and the reverse if a label was forced to white while switching back to light
+                    elif self.theme_mode == "light" and fg_norm in ("white", "#ffffff"):
+                        fg_use = theme["fg"]
+                    else:
+                        fg_use = fg_raw if fg_raw else theme["fg"]
+
+                w.configure(bg=theme["bg"], fg=fg_use)
+            except Exception:
+                pass
+
+        # Buttons & OptionMenu's Menubutton
+        if isinstance(w, (tk.Button, tk.Menubutton)):
+            try:
+                w.configure(
+                    bg=theme["button_bg"],
+                    fg=theme["button_fg"],
+                    activebackground=theme["select_bg"],
+                    activeforeground=theme["select_fg"],
+                )
+            except Exception:
+                pass
+
+        # Entries / Text
+        if isinstance(w, tk.Entry):
+            try:
+                w.configure(
+                    bg=theme["entry_bg"],
+                    fg=theme["entry_fg"],
+                    insertbackground=theme["entry_fg"],
+                    disabledbackground=theme["entry_bg"],
+                    disabledforeground=theme["muted_fg"],
+                )
+            except Exception:
+                pass
+
+        if isinstance(w, tk.Text):
+            try:
+                w.configure(
+                    bg=theme["entry_bg"],
+                    fg=theme["entry_fg"],
+                    insertbackground=theme["entry_fg"],
+                )
+            except Exception:
+                pass
+
+        # Listbox
+        if isinstance(w, tk.Listbox):
+            try:
+                w.configure(
+                    bg=theme["list_bg"],
+                    fg=theme["list_fg"],
+                    selectbackground=theme["select_bg"],
+                    selectforeground=theme["select_fg"],
+                )
+            except Exception:
+                pass
+
+        # Scrollbars
+        if isinstance(w, tk.Scrollbar):
+            try:
+                w.configure(bg=theme["bg"], troughcolor=theme["bg"], activebackground=theme["select_bg"])
+            except Exception:
+                pass
+
+    def _style_menu(self, menu: Menu, theme: Dict[str, str]) -> None:
+        # Menu styling is platform/theme dependent; some systems ignore these options.
+        try:
+            menu.configure(
+                background=theme["bg"],
+                foreground=theme["fg"],
+                activebackground=theme["select_bg"],
+                activeforeground=theme["select_fg"],
+            )
+        except Exception:
+            pass
+
+    def _style_ttk(self, theme: Dict[str, str]) -> None:
+        try:
+            # Use a theme that supports color changes better on many platforms
+            if self.theme_mode == "dark":
+                try:
+                    self.style.theme_use("clam")
+                except Exception:
+                    pass
+            elif self._ttk_theme_default:
+                try:
+                    self.style.theme_use(self._ttk_theme_default)
+                except Exception:
+                    pass
+
+            self.style.configure(
+                "Treeview",
+                background=theme["list_bg"],
+                fieldbackground=theme["list_bg"],
+                foreground=theme["list_fg"],
+            )
+            self.style.map(
+                "Treeview",
+                background=[("selected", theme["select_bg"])],
+                foreground=[("selected", theme["select_fg"])],
+            )
+            self.style.configure(
+                "Treeview.Heading",
+                background=theme["bg"],
+                foreground=theme["fg"],
+            )
+        except Exception:
+            pass
+
+    def _style_window(self, win: Toplevel) -> None:
+        theme = self._get_theme_palette()
+        try:
+            win.configure(bg=theme["bg"])
+        except Exception:
+            pass
+        self._apply_theme_recursive(win, theme)
+        self._style_ttk(theme)
 
     # -------------------------
     # Menu building
@@ -511,6 +842,7 @@ class BookmarkApp:
 
     def show_usage_stats(self) -> None:
         stat_win = Toplevel(self.root)
+        self._style_window(stat_win)
         stat_win.title("Usage Statistics")
         self._set_child_icon(stat_win)
         stat_win.geometry(f"400x300+{self.root.winfo_x()+50}+{self.root.winfo_y()+50}")
@@ -533,6 +865,7 @@ class BookmarkApp:
 
     def manage_bookmarks_window(self) -> None:
         mgr_win = Toplevel(self.root)
+        self._style_window(mgr_win)
         mgr_win.title("Manage Bookmarks")
         self._set_child_icon(mgr_win)
         mgr_win.geometry(f"500x400+{self.root.winfo_x()+50}+{self.root.winfo_y()+50}")
@@ -714,6 +1047,8 @@ class BookmarkApp:
             cat_window.destroy()
 
         cat_window = Toplevel(self.root)
+
+        self._style_window(cat_window)
         cat_window.title("Add Category / Subcategory")
         self._set_child_icon(cat_window)
         cat_window.geometry(f"400x150+{self.root.winfo_x()+50}+{self.root.winfo_y()+50}")
@@ -761,6 +1096,8 @@ class BookmarkApp:
             add_window.destroy()
 
         add_window = Toplevel(self.root)
+
+        self._style_window(add_window)
         add_window.title("Add Bookmark")
         self._set_child_icon(add_window)
         add_window.geometry(f"500x180+{self.root.winfo_x()+50}+{self.root.winfo_y()+50}")
@@ -788,6 +1125,8 @@ class BookmarkApp:
             return
 
         del_window = Toplevel(self.root)
+
+        self._style_window(del_window)
         del_window.title("Delete Bookmark")
         self._set_child_icon(del_window)
         del_window.geometry(f"450x130+{self.root.winfo_x()+50}+{self.root.winfo_y()+50}")
@@ -827,6 +1166,8 @@ class BookmarkApp:
             return
 
         win = Toplevel(self.root)
+
+        self._style_window(win)
         win.title("Delete Category")
         self._set_child_icon(win)
         win.geometry(f"450x130+{self.root.winfo_x()+50}+{self.root.winfo_y()+50}")
@@ -864,6 +1205,8 @@ class BookmarkApp:
             return
 
         select_window = Toplevel(self.root)
+
+        self._style_window(select_window)
         select_window.title("Select Bookmark to Edit")
         self._set_child_icon(select_window)
         select_window.geometry(f"450x130+{self.root.winfo_x()+50}+{self.root.winfo_y()+50}")
@@ -888,6 +1231,8 @@ class BookmarkApp:
             current_name = old_path[-1]
 
             edit_window = Toplevel(self.root)
+
+            self._style_window(edit_window)
             edit_window.title("Edit Bookmark")
             self._set_child_icon(edit_window)
             edit_window.geometry(f"500x200+{self.root.winfo_x()+50}+{self.root.winfo_y()+50}")
@@ -986,6 +1331,8 @@ class BookmarkApp:
             return
 
         select_window = Toplevel(self.root)
+
+        self._style_window(select_window)
         select_window.title("Edit Category")
         self._set_child_icon(select_window)
         select_window.geometry(f"450x130+{self.root.winfo_x()+50}+{self.root.winfo_y()+50}")
@@ -1000,6 +1347,8 @@ class BookmarkApp:
             current_name = path[-1]
 
             edit_window = Toplevel(self.root)
+
+            self._style_window(edit_window)
             edit_window.title("Rename Category")
             self._set_child_icon(edit_window)
             edit_window.geometry(f"400x120+{self.root.winfo_x()+50}+{self.root.winfo_y()+50}")
@@ -1042,6 +1391,7 @@ class BookmarkApp:
 
     def move_item_window(self) -> None:
         move_win = Toplevel(self.root)
+        self._style_window(move_win)
         move_win.title("Move Bookmark/Category")
         self._set_child_icon(move_win)
         move_win.geometry(f"600x150+{self.root.winfo_x()+50}+{self.root.winfo_y()+50}")
@@ -1116,14 +1466,13 @@ class BookmarkApp:
     # -------------------------
 
     def on_closing(self) -> None:
+        # Save the *exact* window-manager geometry string.
+        # This prevents "drift" (eg. moving down each restart) caused by mixing
+        # winfo_* coordinates with wm geometry coordinates.
         self.root.update_idletasks()
-        geom = self.root.winfo_geometry()
-        m = re.match(r"(\d+)x(\d+)\+(\d+)\+(\d+)", geom)
-        if m:
-            width, height, x, y = map(int, m.groups())
-            height += 20
-            geom = f"{width}x{height}+{x}+{y}"
-        self.save_geometry(geom)
+        geom = self.root.wm_geometry()
+        if geom:
+            self.save_geometry(geom)
         self.root.destroy()
 
     def _show_context_menu(self, event: tk.Event) -> None:
