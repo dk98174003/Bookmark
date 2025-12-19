@@ -32,8 +32,7 @@ Bookmark Manager allows you to:
 ## Installation (Windows)
 Simply download and run the exe fiel for windows or the deb file for Linux Mint.
 
-<img width="708" height="112" alt="billede" src="https://github.com/user-attachments/assets/8a8466b0-c324-456a-8ad8-cf693ec2811d" />
-
+<img width="796" height="242" alt="billede" src="https://github.com/user-attachments/assets/223c02fe-0a57-409f-89d0-c44940d6cb77" />
 
 ### Prerequisites
 
