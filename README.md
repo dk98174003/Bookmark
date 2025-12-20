@@ -29,8 +29,8 @@ Bookmark Manager allows you to:
 * Easy drag-and-drop interface for rearranging bookmarks
 * Simple, clear UI built with Tkinter
 
-## Installation (Windows)
-Simply download and run the exe fiel for windows or the deb file for Linux Mint.
+## Installation (LinuxMint & Windows)
+Simply download and run the exe file for windows or the deb file for LinuxMint.
 
 <img width="796" height="242" alt="billede" src="https://github.com/user-attachments/assets/223c02fe-0a57-409f-89d0-c44940d6cb77" />
 
