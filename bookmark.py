@@ -1,151 +1,187 @@
 # -*- coding: utf-8 -*-
-import tkinter as tk
-from tkinter import Menu, messagebox, Toplevel, Label, Entry, Button, StringVar, OptionMenu, filedialog
-from tkinter import ttk  # for Treeview
-import subprocess
 import json
 import os
+import subprocess
 import sys
-import re
+import tkinter as tk
+import webbrowser
+from copy import deepcopy
+from tkinter import Menu, Toplevel, messagebox, filedialog
+from tkinter import ttk
 
-def get_data_dir():
-    # Use current working directory for JSON files
-    return os.getcwd()
+APP_TITLE = "Bookmarks Manager"
+DEFAULT_GEOMETRY = "860x50"
+MIN_WIDTH = 700
+FIXED_HEIGHT = 50
+SORT_BY_USAGE = "usage"
+SORT_BY_NAME = "name"
+BROWSERS = ("LastUsed", "Edge", "Firefox", "Chrome", "Default")
 
-DATA_DIR = get_data_dir()
-BOOKMARKS_FILE = os.path.join(DATA_DIR, "bookmarks.json")
-GEOMETRY_FILE = os.path.join(DATA_DIR, "window_geometry.txt")
-USAGE_FILE = os.path.join(DATA_DIR, "usage.json")
+root = None
+menu = None
+extra_menu = None
+sort_menu = None
+context_menu = None
+browser_var = None
+search_var = None
+search_entry = None
+search_button = None
+icon_path = None
 
-sort_mode = "usage"
+sort_mode = SORT_BY_USAGE
+bookmarks = {}
+usage = {}
+
+
+def get_app_dir() -> str:
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def safe_iconbitmap(window: tk.Misc) -> None:
+    if icon_path and os.path.exists(icon_path):
+        try:
+            window.iconbitmap(icon_path)
+        except Exception:
+            pass
+
+
+APP_DIR = get_app_dir()
+BOOKMARKS_FILE = os.path.join(APP_DIR, "bookmarks.json")
+USAGE_FILE = os.path.join(APP_DIR, "usage.json")
+GEOMETRY_FILE = os.path.join(APP_DIR, "window_geometry.txt")
+
+
+# -----------------------------
+# Persistence and validation
+# -----------------------------
+def load_json_file(path: str, default):
+    if not os.path.exists(path):
+        return deepcopy(default)
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            return json.load(handle)
+    except json.JSONDecodeError as exc:
+        messagebox.showerror("Load Error", f"Could not load '{os.path.basename(path)}':\n{exc}")
+        return deepcopy(default)
+    except OSError as exc:
+        messagebox.showerror("Load Error", f"Could not read '{os.path.basename(path)}':\n{exc}")
+        return deepcopy(default)
+
+
+def save_json_file(path: str, data) -> bool:
+    try:
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, indent=4, ensure_ascii=False)
+        return True
+    except OSError as exc:
+        messagebox.showerror("Save Error", f"Could not write '{os.path.basename(path)}':\n{exc}")
+        return False
+
+
+def save_bookmarks() -> bool:
+    return save_json_file(BOOKMARKS_FILE, bookmarks)
+
+
+def save_usage() -> bool:
+    return save_json_file(USAGE_FILE, usage)
+
 
 def load_bookmarks():
-    if os.path.exists(BOOKMARKS_FILE):
-        try:
-            with open(BOOKMARKS_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except json.JSONDecodeError as e:
-            messagebox.showerror("Load Error", f"Could not load bookmarks: {e}")
-            return {}
-    return {}
+    data = load_json_file(BOOKMARKS_FILE, {})
+    if not isinstance(data, dict):
+        messagebox.showerror("Load Error", "Bookmarks file must contain a JSON object at the top level.")
+        return {}
+    return normalize_bookmark_tree(data)
 
-def save_bookmarks():
-    with open(BOOKMARKS_FILE, "w", encoding="utf-8") as f:
-        json.dump(bookmarks, f, indent=4)
 
 def load_usage():
-    if os.path.exists(USAGE_FILE):
-        try:
-            with open(USAGE_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except json.JSONDecodeError as e:
-            messagebox.showerror("Load Error", f"Could not load usage data: {e}")
-            return {}
-    return {}
+    data = load_json_file(USAGE_FILE, {})
+    if not isinstance(data, dict):
+        return {}
+    return data
 
-def save_usage():
-    with open(USAGE_FILE, "w", encoding="utf-8") as f:
-        json.dump(usage, f, indent=4)
 
-def sync_usage_structure(bm_dict, usage_dict):
-    for key in list(usage_dict.keys()):
-        if key not in bm_dict:
-            del usage_dict[key]
-    for key, value in bm_dict.items():
+def normalize_bookmark_tree(node):
+    if not isinstance(node, dict):
+        return {}
+
+    normalized = {}
+    for key, value in node.items():
+        if not isinstance(key, str):
+            key = str(key)
         if isinstance(value, dict):
-            if key not in usage_dict or not isinstance(usage_dict.get(key), dict):
-                usage_dict[key] = {}
-            sync_usage_structure(value, usage_dict[key])
+            normalized[key] = normalize_bookmark_tree(value)
         else:
-            if key not in usage_dict or not isinstance(usage_dict.get(key), dict):
-                usage_dict[key] = {"count": 0, "last_browser": None}
-            else:
-                if "count" not in usage_dict[key]:
-                    usage_dict[key]["count"] = 0
-                if "last_browser" not in usage_dict[key]:
-                    usage_dict[key]["last_browser"] = None
-    return usage_dict
+            normalized[key] = str(value)
+    return normalized
 
-def get_usage_entry(path):
-    node = usage
+
+def sync_usage_structure(bookmark_node, usage_node):
+    if not isinstance(usage_node, dict):
+        usage_node = {}
+
+    for key in list(usage_node.keys()):
+        if key not in bookmark_node:
+            del usage_node[key]
+
+    for key, value in bookmark_node.items():
+        if isinstance(value, dict):
+            usage_node[key] = sync_usage_structure(value, usage_node.get(key, {}))
+        else:
+            entry = usage_node.get(key)
+            if not isinstance(entry, dict):
+                entry = {}
+            entry["count"] = int(entry.get("count", 0) or 0)
+            entry["last_browser"] = entry.get("last_browser")
+            usage_node[key] = entry
+
+    return usage_node
+
+
+def load_geometry():
+    if not os.path.exists(GEOMETRY_FILE):
+        return None
+    try:
+        with open(GEOMETRY_FILE, "r", encoding="utf-8") as handle:
+            value = handle.read().strip()
+        return value or None
+    except OSError:
+        return None
+
+
+def save_geometry(geometry: str) -> None:
+    try:
+        with open(GEOMETRY_FILE, "w", encoding="utf-8") as handle:
+            handle.write(geometry)
+    except OSError as exc:
+        messagebox.showerror("Save Error", f"Could not save window geometry:\n{exc}")
+
+
+# -----------------------------
+# Tree helpers
+# -----------------------------
+def get_node_by_path(data: dict, path: tuple):
+    node = data
     for key in path:
-        node = node.get(key)
-        if node is None:
+        if not isinstance(node, dict) or key not in node:
             return None
+        node = node[key]
     return node
 
-def sum_all_usage(node):
-    if isinstance(node, dict):
-        if "count" in node:
-            return node["count"]
-        else:
-            total = 0
-            for val in node.values():
-                total += sum_all_usage(val)
-            return total
-    return 0
 
-def get_usage_sum(path):
-    node = usage
-    for key in path:
-        node = node.get(key, {})
-    return sum_all_usage(node)
+def get_parent_dict(data: dict, path: tuple):
+    if not path:
+        return None
+    if len(path) == 1:
+        return data
+    return get_node_by_path(data, path[:-1])
 
-def open_link_with_browser(link, browser_used):
-    if link.lower().startswith("http://") or link.lower().startswith("https://"):
-        try:
-            if browser_used == "Chrome":
-                path = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
-                if not os.path.exists(path):
-                    path = r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"
-                subprocess.Popen([path, link])
-            elif browser_used == "Firefox":
-                path = r"C:\Program Files\Mozilla Firefox\firefox.exe"
-                if not os.path.exists(path):
-                    path = r"C:\Program Files (x86)\Mozilla Firefox\firefox.exe"
-                subprocess.Popen([path, link])
-            elif browser_used == "Edge":
-                path = r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
-                if not os.path.exists(path):
-                    path = r"C:\Program Files\Microsoft\Edge\Application\msedge.exe"
-                subprocess.Popen([path, link])
-            else:
-                os.startfile(link)
-        except Exception as e:
-            messagebox.showerror("Browser Error", f"Could not open URL with {browser_used}: {e}")
-    else:
-        if os.path.exists(link):
-            try:
-                os.startfile(link)
-                return
-            except Exception as e:
-                messagebox.showerror("Error", f"Could not open file '{link}': {e}")
-                return
-        try:
-            subprocess.Popen(link, shell=True)
-        except Exception as e:
-            messagebox.showerror("Error", f"Could not run command '{link}': {e}")
 
-def record_usage_and_open(link, path):
-    entry = get_usage_entry(path)
-    if entry is None:
-        entry = {"count": 0, "last_browser": None}
-    entry["count"] += 1
-    sel = browser_var.get()
-    if sel == "LastUsed":
-        if entry["last_browser"]:
-            used_browser = entry["last_browser"]
-        else:
-            used_browser = "Default"
-            entry["last_browser"] = used_browser
-    else:
-        used_browser = sel
-        entry["last_browser"] = used_browser
-    save_usage()
-    update_menu()
-    open_link_with_browser(link, used_browser)
-
-def get_all_category_paths(data, current_path=()):
+def get_all_category_paths(data=None, current_path=()):
+    if data is None:
+        data = bookmarks
     paths = []
     for key, value in data.items():
         if isinstance(value, dict):
@@ -154,454 +190,174 @@ def get_all_category_paths(data, current_path=()):
             paths.extend(get_all_category_paths(value, new_path))
     return paths
 
-def get_all_bookmark_paths(data, current_path=()):
-    bms = []
+
+def get_all_bookmark_paths(data=None, current_path=()):
+    if data is None:
+        data = bookmarks
+    result = []
     for key, value in data.items():
+        new_path = current_path + (key,)
         if isinstance(value, dict):
-            bms.extend(get_all_bookmark_paths(value, current_path + (key,)))
+            result.extend(get_all_bookmark_paths(value, new_path))
         else:
-            display = " > ".join(current_path + (key,))
-            bms.append((display, current_path + (key,)))
-    return bms
+            result.append((" > ".join(new_path), new_path))
+    return result
 
-def get_category_by_path(data, path):
-    for key in path:
-        data = data.get(key, {})
-    return data
 
-def get_bookmark_by_path(bm, path):
+def get_bookmark_link(path: tuple):
+    value = get_node_by_path(bookmarks, path)
+    return value if isinstance(value, str) else None
+
+
+def delete_node_by_path(data: dict, path: tuple) -> bool:
+    parent = get_parent_dict(data, path)
+    if parent is None:
+        return False
+    if path[-1] not in parent:
+        return False
+    del parent[path[-1]]
+    return True
+
+
+def ensure_usage_entry(path: tuple):
+    node = usage
     for key in path[:-1]:
-        bm = bm.get(key, {})
-    return bm.get(path[-1])
+        child = node.get(key)
+        if not isinstance(child, dict):
+            child = {}
+            node[key] = child
+        node = child
 
-def delete_category_by_path(data, path):
-    if len(path) == 1:
-        if path[0] in data:
-            del data[path[0]]
+    entry = node.get(path[-1])
+    if not isinstance(entry, dict):
+        entry = {"count": 0, "last_browser": None}
+        node[path[-1]] = entry
+
+    entry["count"] = int(entry.get("count", 0) or 0)
+    entry["last_browser"] = entry.get("last_browser")
+    return entry
+
+
+def sum_all_usage(node) -> int:
+    if not isinstance(node, dict):
+        return 0
+    if "count" in node:
+        return int(node.get("count", 0) or 0)
+    return sum(sum_all_usage(value) for value in node.values())
+
+
+def get_usage_sum(path: tuple) -> int:
+    node = usage
+    for key in path:
+        if not isinstance(node, dict):
+            return 0
+        node = node.get(key, {})
+    return sum_all_usage(node)
+
+
+def is_descendant_path(parent_path: tuple, child_path: tuple) -> bool:
+    return len(child_path) >= len(parent_path) and child_path[:len(parent_path)] == parent_path
+
+
+# -----------------------------
+# Opening links / commands
+# -----------------------------
+def browser_executable(browser_name: str):
+    if os.name != "nt":
+        return None
+
+    lookup = {
+        "Chrome": [
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+        ],
+        "Firefox": [
+            r"C:\Program Files\Mozilla Firefox\firefox.exe",
+            r"C:\Program Files (x86)\Mozilla Firefox\firefox.exe",
+        ],
+        "Edge": [
+            r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+            r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+        ],
+    }
+
+    for candidate in lookup.get(browser_name, []):
+        if os.path.exists(candidate):
+            return candidate
+    return None
+
+
+def is_url(value: str) -> bool:
+    text = value.lower().strip()
+    return text.startswith("http://") or text.startswith("https://")
+
+
+def open_url(link: str, browser_name: str):
+    if browser_name in ("Default", "LastUsed"):
+        webbrowser.open(link)
+        return
+
+    executable = browser_executable(browser_name)
+    if executable:
+        subprocess.Popen([executable, link])
+        return
+
+    webbrowser.open(link)
+
+
+def open_path_or_command(link: str):
+    link = link.strip()
+
+    if os.path.exists(link):
+        if os.name == "nt":
+            os.startfile(link)
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", link])
+        else:
+            subprocess.Popen(["xdg-open", link])
+        return
+
+    subprocess.Popen(link, shell=True)
+
+
+def open_link_with_browser(link: str, browser_name: str):
+    try:
+        if is_url(link):
+            open_url(link, browser_name)
+        else:
+            open_path_or_command(link)
+    except Exception as exc:
+        messagebox.showerror("Open Error", f"Could not open:\n{link}\n\nReason:\n{exc}")
+
+
+def record_usage_and_open(link: str, path: tuple):
+    entry = ensure_usage_entry(path)
+
+    selected = browser_var.get()
+    if selected == "LastUsed":
+        used_browser = entry.get("last_browser") or "Default"
     else:
-        parent = get_category_by_path(data, path[:-1])
-        if path[-1] in parent:
-            del parent[path[-1]]
+        used_browser = selected
 
-def add_category_window():
-    def save_category():
-        parent_sel = parent_var.get()
-        new_cat = cat_entry.get().strip()
-        if not new_cat:
-            messagebox.showwarning("Invalid Input", "Category name is required!")
-            return
-        if parent_sel == "None":
-            if new_cat in bookmarks:
-                messagebox.showwarning("Exists", "A top-level category with this name already exists!")
-                return
-            bookmarks[new_cat] = {}
-            usage[new_cat] = {}
-        else:
-            parent_path = tuple(parent_sel.split(" > "))
-            parent_cat = get_category_by_path(bookmarks, parent_path)
-            parent_usage = get_category_by_path(usage, parent_path)
-            if new_cat in parent_cat:
-                messagebox.showwarning("Exists", "A category with this name already exists here!")
-                return
-            parent_cat[new_cat] = {}
-            parent_usage[new_cat] = {}
-        save_bookmarks()
-        save_usage()
-        update_menu()
-        cat_window.destroy()
+    entry["count"] = int(entry.get("count", 0) or 0) + 1
+    entry["last_browser"] = used_browser
 
-    cat_window = Toplevel(root)
-    cat_window.iconbitmap(icon_path)
-    cat_window.title("Add Category / Subcategory")
-    cat_window.geometry("400x150+" + str(root.winfo_x() + 50) + "+" + str(root.winfo_y() + 50))
-    Label(cat_window, text="Parent Category (or None):").grid(row=0, column=0, padx=10, pady=5, sticky="w")
-    parent_options = ["None"] + [" > ".join(path) for path in get_all_category_paths(bookmarks)]
-    parent_var = StringVar(cat_window)
-    parent_var.set("None")
-    OptionMenu(cat_window, parent_var, *parent_options).grid(row=0, column=1, padx=10, pady=5, sticky="ew")
-    Label(cat_window, text="New Category Name:").grid(row=1, column=0, padx=10, pady=5, sticky="w")
-    cat_entry = Entry(cat_window)
-    cat_entry.grid(row=1, column=1, padx=10, pady=5, sticky="ew")
-    Button(cat_window, text="Add Category", command=save_category).grid(row=2, column=1, padx=10, pady=10, sticky="e")
-    cat_window.columnconfigure(1, weight=1)
+    save_usage()
+    update_menu()
+    open_link_with_browser(link, used_browser)
 
-def add_bookmark_window():
-    def save_new_bookmark():
-        sel = parent_var.get()
-        name = name_entry.get().strip()
-        link = url_entry.get().strip()
-        if not name or not link:
-            messagebox.showwarning("Invalid Input", "Both Name and URL/Command are required!")
-            return
-        if sel == "None":
-            if name in bookmarks:
-                messagebox.showwarning("Exists", "A top-level item with this name already exists!")
-                return
-            bookmarks[name] = link
-            usage[name] = {"count": 0, "last_browser": None}
-        else:
-            cat_path = tuple(sel.split(" > "))
-            category = get_category_by_path(bookmarks, cat_path)
-            category_usage = get_category_by_path(usage, cat_path)
-            if name in category:
-                messagebox.showwarning("Exists", "An item with this name already exists here!")
-                return
-            category[name] = link
-            category_usage[name] = {"count": 0, "last_browser": None}
-        save_bookmarks()
-        save_usage()
-        update_menu()
-        add_window.destroy()
 
-    add_window = Toplevel(root)
-    add_window.iconbitmap(icon_path)
-    add_window.title("Add Bookmark")
-    add_window.geometry("500x180+" + str(root.winfo_x() + 50) + "+" + str(root.winfo_y() + 50))
-    Label(add_window, text="Select Category (or None):").grid(row=0, column=0, padx=10, pady=5, sticky="w")
-    parent_options = ["None"] + [" > ".join(path) for path in get_all_category_paths(bookmarks)]
-    parent_var = StringVar(add_window)
-    parent_var.set("None")
-    OptionMenu(add_window, parent_var, *parent_options).grid(row=0, column=1, padx=10, pady=5, sticky="ew")
-    Label(add_window, text="Bookmark Name:").grid(row=1, column=0, padx=10, pady=5, sticky="w")
-    name_entry = Entry(add_window)
-    name_entry.grid(row=1, column=1, padx=10, pady=5, sticky="ew")
-    Label(add_window, text="URL / Command:").grid(row=2, column=0, padx=10, pady=5, sticky="w")
-    url_entry = Entry(add_window, width=60)
-    url_entry.grid(row=2, column=1, padx=10, pady=5, sticky="ew")
-    Button(add_window, text="Add Bookmark", command=save_new_bookmark).grid(row=3, column=1, padx=10, pady=10, sticky="e")
-    add_window.columnconfigure(1, weight=1)
+# -----------------------------
+# Menu building
+# -----------------------------
+def sorted_keys_for_menu(items: dict, current_path: tuple):
+    if sort_mode == SORT_BY_USAGE:
+        return sorted(items.keys(), key=lambda key: get_usage_sum(current_path + (key,)), reverse=True)
+    return sorted(items.keys(), key=lambda key: key.lower())
 
-def delete_bookmark_window():
-    bm_list = get_all_bookmark_paths(bookmarks)
-    if not bm_list:
-        messagebox.showwarning("No Bookmarks", "There are no bookmarks to delete.")
-        return
-    del_window = Toplevel(root)
-    del_window.iconbitmap(icon_path)
-    del_window.title("Delete Bookmark")
-    del_window.geometry("450x130+" + str(root.winfo_x() + 50) + "+" + str(root.winfo_y() + 50))
-    Label(del_window, text="Select Bookmark to Delete:").grid(row=0, column=0, padx=10, pady=5, sticky="w")
-    options = [display for display, _ in bm_list]
-    selected_var = StringVar(del_window)
-    selected_var.set(options[0])
-    OptionMenu(del_window, selected_var, *options).grid(row=0, column=1, padx=10, pady=5, sticky="ew")
 
-    def delete_selected():
-        sel_display = selected_var.get()
-        for display, path in bm_list:
-            if display == sel_display:
-                if len(path) == 1:
-                    del bookmarks[path[0]]
-                    usage.pop(path[0], None)
-                else:
-                    parent = get_category_by_path(bookmarks, path[:-1])
-                    del parent[path[-1]]
-                    usage_parent = get_category_by_path(usage, path[:-1])
-                    usage_parent.pop(path[-1], None)
-                break
-        save_bookmarks()
-        save_usage()
-        update_menu()
-        del_window.destroy()
-
-    Button(del_window, text="Delete", command=delete_selected).grid(row=1, column=1, padx=10, pady=10, sticky="e")
-    del_window.columnconfigure(1, weight=1)
-
-def delete_category_window():
-    cat_paths = get_all_category_paths(bookmarks)
-    if not cat_paths:
-        messagebox.showwarning("No Categories", "There are no categories to delete.")
-        return
-    cat_del_window = Toplevel(root)
-    cat_del_window.iconbitmap(icon_path)
-    cat_del_window.title("Delete Category")
-    cat_del_window.geometry("450x130+" + str(root.winfo_x() + 50) + "+" + str(root.winfo_y() + 50))
-    Label(cat_del_window, text="Select Category to Delete:").grid(row=0, column=0, padx=10, pady=5, sticky="w")
-    options = [" > ".join(path) for path in cat_paths]
-    selected_var = StringVar(cat_del_window)
-    selected_var.set(options[0])
-    OptionMenu(cat_del_window, selected_var, *options).grid(row=0, column=1, padx=10, pady=5, sticky="ew")
-
-    def delete_category():
-        sel = selected_var.get()
-        path = tuple(sel.split(" > "))
-        delete_category_by_path(bookmarks, path)
-        delete_category_by_path(usage, path)
-        save_bookmarks()
-        save_usage()
-        update_menu()
-        cat_del_window.destroy()
-
-    Button(cat_del_window, text="Delete Category", command=delete_category).grid(row=1, column=1, padx=10, pady=10, sticky="e")
-    cat_del_window.columnconfigure(1, weight=1)
-
-def edit_bookmark_window():
-    bm_list = get_all_bookmark_paths(bookmarks)
-    if not bm_list:
-        messagebox.showwarning("No Bookmarks", "There are no bookmarks to edit.")
-        return
-    select_window = Toplevel(root)
-    select_window.iconbitmap(icon_path)
-    select_window.title("Select Bookmark to Edit")
-    select_window.geometry("450x130+" + str(root.winfo_x() + 50) + "+" + str(root.winfo_y() + 50))
-    Label(select_window, text="Select Bookmark to Edit:").grid(row=0, column=0, padx=10, pady=5, sticky="w")
-    options = [display for display, _ in bm_list]
-    selected_var = StringVar(select_window)
-    selected_var.set(options[0])
-    OptionMenu(select_window, selected_var, *options).grid(row=0, column=1, padx=10, pady=5, sticky="ew")
-
-    def open_edit_form():
-        sel_display = selected_var.get()
-        old_path = None
-        current_link = ""
-        current_category = "None"
-        current_name = ""
-        for display, path in bm_list:
-            if display == sel_display:
-                old_path = path
-                break
-        if old_path is None:
-            return
-        if len(old_path) == 1:
-            current_link = bookmarks[old_path[0]]
-            current_name = old_path[0]
-        else:
-            parent_path = old_path[:-1]
-            parent = get_category_by_path(bookmarks, parent_path)
-            current_link = parent[old_path[-1]]
-            current_category = " > ".join(parent_path) if parent_path else "None"
-            current_name = old_path[-1]
-
-        edit_window = Toplevel(root)
-        edit_window.iconbitmap(icon_path)
-        edit_window.title("Edit Bookmark")
-        edit_window.geometry("500x200+" + str(root.winfo_x() + 50) + "+" + str(root.winfo_y() + 50))
-
-        Label(edit_window, text="Select Category (or None):").grid(row=0, column=0, padx=10, pady=5, sticky="w")
-        parent_options = ["None"] + [" > ".join(path) for path in get_all_category_paths(bookmarks)]
-        new_parent_var = StringVar(edit_window)
-        if current_category in parent_options:
-            new_parent_var.set(current_category)
-        else:
-            new_parent_var.set("None")
-        OptionMenu(edit_window, new_parent_var, *parent_options).grid(row=0, column=1, padx=10, pady=5, sticky="ew")
-
-        Label(edit_window, text="Bookmark Name:").grid(row=1, column=0, padx=10, pady=5, sticky="w")
-        name_entry = Entry(edit_window)
-        name_entry.insert(0, current_name)
-        name_entry.grid(row=1, column=1, padx=10, pady=5, sticky="ew")
-
-        Label(edit_window, text="URL / Command:").grid(row=2, column=0, padx=10, pady=5, sticky="w")
-        url_entry = Entry(edit_window, width=60)
-        url_entry.insert(0, current_link)
-        url_entry.grid(row=2, column=1, padx=10, pady=5, sticky="ew")
-
-        def save_edited_bookmark():
-            new_cat_str = new_parent_var.get()
-            new_name = name_entry.get().strip()
-            new_link = url_entry.get().strip()
-            if not new_name or not new_link:
-                messagebox.showwarning("Invalid Input", "Name and URL/command are required!")
-                return
-            if len(old_path) == 1:
-                del bookmarks[old_path[0]]
-                old_usage = usage.pop(old_path[0], {"count":0, "last_browser":None})
-            else:
-                parent = get_category_by_path(bookmarks, old_path[:-1])
-                del parent[old_path[-1]]
-                usage_parent = get_category_by_path(usage, old_path[:-1])
-                old_usage = usage_parent.pop(old_path[-1], {"count":0, "last_browser":None})
-
-            if new_cat_str == "None":
-                target_bookmarks = bookmarks
-                target_usage = usage
-            else:
-                new_cat_path = tuple(new_cat_str.split(" > "))
-                target_bookmarks = get_category_by_path(bookmarks, new_cat_path)
-                target_usage = get_category_by_path(usage, new_cat_path)
-
-            if new_name in target_bookmarks:
-                messagebox.showwarning("Exists", "A bookmark with this name already exists in that category!")
-                if len(old_path) == 1:
-                    bookmarks[old_path[0]] = current_link
-                    usage[old_path[0]] = old_usage
-                else:
-                    parent = get_category_by_path(bookmarks, old_path[:-1])
-                    parent[old_path[-1]] = current_link
-                    usage_parent = get_category_by_path(usage, old_path[:-1])
-                    usage_parent[old_path[-1]] = old_usage
-                return
-            target_bookmarks[new_name] = new_link
-            target_usage[new_name] = old_usage
-
-            save_bookmarks()
-            save_usage()
-            update_menu()
-            edit_window.destroy()
-            select_window.destroy()
-
-        Button(edit_window, text="Save Changes", command=save_edited_bookmark).grid(row=3, column=1, padx=10, pady=10, sticky="e")
-        edit_window.columnconfigure(1, weight=1)
-
-    Button(select_window, text="Edit", command=open_edit_form).grid(row=1, column=1, padx=10, pady=10, sticky="e")
-    select_window.columnconfigure(1, weight=1)
-
-def edit_category_window():
-    cat_paths = get_all_category_paths(bookmarks)
-    if not cat_paths:
-        messagebox.showwarning("No Categories", "There are no categories to edit.")
-        return
-    select_window = Toplevel(root)
-    select_window.iconbitmap(icon_path)
-    select_window.title("Edit Category")
-    select_window.geometry("450x130+" + str(root.winfo_x() + 50) + "+" + str(root.winfo_y() + 50))
-    Label(select_window, text="Select Category to Edit:").grid(row=0, column=0, padx=10, pady=5, sticky="w")
-    options = [" > ".join(path) for path in cat_paths]
-    selected_var = StringVar(select_window)
-    selected_var.set(options[0])
-    OptionMenu(select_window, selected_var, *options).grid(row=0, column=1, padx=10, pady=5, sticky="ew")
-
-    def open_category_edit():
-        sel = selected_var.get()
-        path = tuple(sel.split(" > "))
-        current_name = path[-1]
-
-        edit_window = Toplevel(root)
-        edit_window.iconbitmap(icon_path)
-        edit_window.title("Rename Category")
-        edit_window.geometry("400x120+" + str(root.winfo_x() + 50) + "+" + str(root.winfo_y() + 50))
-
-        Label(edit_window, text="New Category Name:").grid(row=0, column=0, padx=10, pady=5, sticky="w")
-        name_entry = Entry(edit_window)
-        name_entry.insert(0, current_name)
-        name_entry.grid(row=0, column=1, padx=10, pady=5, sticky="ew")
-
-        def save_edited_category():
-            new_name = name_entry.get().strip()
-            if not new_name:
-                messagebox.showwarning("Invalid Input", "Category name is required!")
-                return
-            parent_bm = bookmarks if len(path) == 1 else get_category_by_path(bookmarks, path[:-1])
-            parent_usage = usage if len(path) == 1 else get_category_by_path(usage, path[:-1])
-            if new_name in parent_bm:
-                messagebox.showwarning("Exists", "A category with this name already exists at this level!")
-                return
-            value_bm = parent_bm[path[-1]]
-            del parent_bm[path[-1]]
-            parent_bm[new_name] = value_bm
-
-            value_usage = parent_usage.get(path[-1], {})
-            del parent_usage[path[-1]]
-            parent_usage[new_name] = value_usage
-
-            save_bookmarks()
-            save_usage()
-            update_menu()
-            edit_window.destroy()
-            select_window.destroy()
-
-        Button(edit_window, text="Save Changes", command=save_edited_category).grid(row=1, column=1, padx=10, pady=10, sticky="e")
-        edit_window.columnconfigure(1, weight=1)
-
-    Button(select_window, text="Edit", command=open_category_edit).grid(row=1, column=1, padx=10, pady=10, sticky="e")
-    select_window.columnconfigure(1, weight=1)
-
-def move_item_window():
-    move_win = Toplevel(root)
-    move_win.iconbitmap(icon_path)
-    move_win.title("Move Bookmark/Category")
-    move_win.geometry("600x150+" + str(root.winfo_x() + 50) + "+" + str(root.winfo_y() + 50))
-
-    movable_items = []
-    for display, path in get_all_bookmark_paths(bookmarks):
-        movable_items.append(("Bookmark: " + display, "bookmark", path))
-    for path in get_all_category_paths(bookmarks):
-        movable_items.append(("Category: " + " > ".join(path), "category", path))
-
-    if not movable_items:
-        messagebox.showwarning("No Items", "There are no bookmarks or categories to move.")
-        move_win.destroy()
-        return
-
-    item_mapping = {item[0]: (item[1], item[2]) for item in movable_items}
-
-    Label(move_win, text="Select item to move:").grid(row=0, column=0, padx=10, pady=5, sticky="w")
-    item_var = StringVar(move_win)
-    item_var.set(list(item_mapping.keys())[0])
-    OptionMenu(move_win, item_var, *list(item_mapping.keys())).grid(row=0, column=1, padx=10, pady=5, sticky="ew")
-
-    Label(move_win, text="Select destination category (or 'None'):").grid(row=1, column=0, padx=10, pady=5, sticky="w")
-    dest_options = ["None"] + [" > ".join(path) for path in get_all_category_paths(bookmarks)]
-    dest_var = StringVar(move_win)
-    dest_var.set("None")
-    OptionMenu(move_win, dest_var, *dest_options).grid(row=1, column=1, padx=10, pady=5, sticky="ew")
-
-    def move_selected():
-        selected_item = item_var.get()
-        item_type, old_path = item_mapping[selected_item]
-        dest_sel = dest_var.get()
-        if dest_sel == "None":
-            new_parent_dict = bookmarks
-            new_usage_dict = usage
-        else:
-            new_parent_path = tuple(dest_sel.split(" > "))
-            new_parent_dict = get_category_by_path(bookmarks, new_parent_path)
-            new_usage_dict = get_category_by_path(usage, new_parent_path)
-
-        if item_type == "bookmark":
-            if len(old_path) == 1:
-                old_parent = bookmarks
-                old_usage_parent = usage
-            else:
-                old_parent = get_category_by_path(bookmarks, old_path[:-1])
-                old_usage_parent = get_category_by_path(usage, old_path[:-1])
-            item_name = old_path[-1]
-            if item_name in new_parent_dict:
-                messagebox.showerror("Move Error", f"An item with name '{item_name}' already exists in destination.")
-                return
-            new_parent_dict[item_name] = old_parent[item_name]
-            del old_parent[item_name]
-            new_usage_dict[item_name] = old_usage_parent.get(item_name, {"count": 0, "last_browser": None})
-            if item_name in old_usage_parent:
-                del old_usage_parent[item_name]
-        elif item_type == "category":
-            if len(old_path) == 1:
-                old_parent = bookmarks
-                old_usage_parent = usage
-            else:
-                old_parent = get_category_by_path(bookmarks, old_path[:-1])
-                old_usage_parent = get_category_by_path(usage, old_path[:-1])
-            cat_name = old_path[-1]
-            if cat_name in new_parent_dict:
-                messagebox.showerror("Move Error", f"A category named '{cat_name}' already exists in destination.")
-                return
-            new_parent_dict[cat_name] = old_parent[cat_name]
-            del old_parent[cat_name]
-            new_usage_dict[cat_name] = old_usage_parent.get(cat_name, {})
-            if cat_name in old_usage_parent:
-                del old_usage_parent[cat_name]
-        else:
-            messagebox.showerror("Move Error", "Unknown item type.")
-            return
-        save_bookmarks()
-        save_usage()
-        update_menu()
-        move_win.destroy()
-
-    Button(move_win, text="Move", command=move_selected).grid(row=2, column=1, padx=10, pady=10, sticky="e")
-    move_win.columnconfigure(1, weight=1)
-
-menu_references = {}
-
-def build_bookmarks_menu(parent_menu, items, current_path=()):
-    if sort_mode == "usage":
-        sorted_keys = sorted(items.keys(),
-                             key=lambda k: get_usage_sum(current_path + (k,)),
-                             reverse=True)
-    else:
-        sorted_keys = sorted(items.keys(), key=lambda k: k.lower())
-
-    for name in sorted_keys:
+def build_bookmarks_menu(parent_menu: Menu, items: dict, current_path=()):
+    for name in sorted_keys_for_menu(items, current_path):
         value = items[name]
         new_path = current_path + (name,)
         if isinstance(value, dict):
@@ -609,279 +365,667 @@ def build_bookmarks_menu(parent_menu, items, current_path=()):
             build_bookmarks_menu(submenu, value, new_path)
             parent_menu.add_cascade(label=name, menu=submenu)
         else:
-            if not isinstance(value, str):
-                messagebox.showerror("Invalid Bookmark",
-                                     f"Bookmark '{' > '.join(new_path)}' has invalid link: {value}")
-                continue
             parent_menu.add_command(
                 label=name,
-                command=lambda link=value, p=new_path: record_usage_and_open(link, p)
+                command=lambda link=value, path=new_path: record_usage_and_open(link, path),
             )
-            menu_references[new_path] = (parent_menu, parent_menu.index("end"))
+
 
 def update_menu():
     menu.delete(0, tk.END)
-    menu_references.clear()
-
     build_bookmarks_menu(menu, bookmarks)
     menu.add_separator()
-
     menu.add_cascade(label="Tools", menu=extra_menu)
     menu.add_cascade(label="Sort", menu=sort_menu)
 
-suggestion_listbox = None
 
-def update_suggestions(*_trace_args):
-    global suggestion_listbox
-    query = search_var.get().strip().lower()
-    if suggestion_listbox:
-        suggestion_listbox.destroy()
-        suggestion_listbox = None
-    if not query:
-        return
-    matches = []
-    all_bms = get_all_bookmark_paths(bookmarks)
-    for display, path in all_bms:
-        if query in display.lower():
-            matches.append((display, path))
-    if matches:
-        suggestion_listbox = tk.Listbox(root, height=min(len(matches), 6))
-        x = search_entry.winfo_rootx()
-        y = search_entry.winfo_rooty() + search_entry.winfo_height()
-        suggestion_listbox.place(x=x, y=y)
-        for display, _ in matches:
-            suggestion_listbox.insert(tk.END, display)
+# -----------------------------
+# Small UI helpers
+# -----------------------------
+def position_child_window(window: Toplevel, width: int, height: int):
+    x = root.winfo_x() + 40
+    y = root.winfo_y() + 40
+    window.geometry(f"{width}x{height}+{x}+{y}")
 
-        def on_select(evt):
-            w = evt.widget
-            idx = w.curselection()
-            if not idx:
+
+def set_option_menu(variable: tk.StringVar, menu_parent, values, default_value):
+    if not values:
+        values = [default_value]
+    variable.set(default_value)
+    return tk.OptionMenu(menu_parent, variable, *values)
+
+
+def path_to_label(path: tuple) -> str:
+    return " > ".join(path)
+
+
+def category_option_list(include_none=True):
+    values = [path_to_label(path) for path in get_all_category_paths()]
+    if include_none:
+        return ["None", *values]
+    return values
+
+
+# -----------------------------
+# CRUD windows
+# -----------------------------
+def add_category_window():
+    window = Toplevel(root)
+    safe_iconbitmap(window)
+    window.title("Add Category / Subcategory")
+    position_child_window(window, 430, 160)
+
+    tk.Label(window, text="Parent Category (or None):").grid(row=0, column=0, padx=10, pady=8, sticky="w")
+    parent_var = tk.StringVar(window)
+    parent_menu = set_option_menu(parent_var, window, category_option_list(True), "None")
+    parent_menu.grid(row=0, column=1, padx=10, pady=8, sticky="ew")
+
+    tk.Label(window, text="New Category Name:").grid(row=1, column=0, padx=10, pady=8, sticky="w")
+    name_entry = tk.Entry(window)
+    name_entry.grid(row=1, column=1, padx=10, pady=8, sticky="ew")
+    name_entry.focus_set()
+
+    def save_category_action():
+        new_name = name_entry.get().strip()
+        if not new_name:
+            messagebox.showwarning("Invalid Input", "Category name is required.")
+            return
+
+        selected_parent = parent_var.get()
+        if selected_parent == "None":
+            target_bm = bookmarks
+            target_usage = usage
+        else:
+            parent_path = tuple(selected_parent.split(" > "))
+            target_bm = get_node_by_path(bookmarks, parent_path)
+            target_usage = get_node_by_path(usage, parent_path)
+            if not isinstance(target_bm, dict) or not isinstance(target_usage, dict):
+                messagebox.showerror("Add Error", "Selected parent category is invalid.")
                 return
-            sel_display = w.get(idx[0])
-            for d, p in matches:
-                if d == sel_display:
-                    link = get_bookmark_by_path(bookmarks, p)
-                    record_usage_and_open(link, p)
-                    break
-            search_var.set("")
-            w.destroy()
 
-        suggestion_listbox.bind("<<ListboxSelect>>", on_select)
+        if new_name in target_bm:
+            messagebox.showwarning("Exists", "An item with that name already exists there.")
+            return
 
-def show_usage_stats():
-    stat_win = Toplevel(root)
-    stat_win.iconbitmap(icon_path)
-    stat_win.title("Usage Statistics")
-    stat_win.geometry("400x300+" + str(root.winfo_x() + 50) + "+" + str(root.winfo_y() + 50))
-    text = tk.Text(stat_win, wrap="none")
-    text.pack(fill="both", expand=True)
+        target_bm[new_name] = {}
+        target_usage[new_name] = {}
 
-    def recurse_stats(bm_dict, usage_dict, path_prefix=""):
-        for k, v in bm_dict.items():
-            new_prefix = path_prefix + k
-            if isinstance(v, dict):
-                cusage = sum_all_usage(usage_dict.get(k, {}))
-                text.insert(tk.END, f"[Category] {new_prefix} - total usage: {cusage}\n")
-                recurse_stats(v, usage_dict.get(k, {}), new_prefix + " > ")
+        if save_bookmarks() and save_usage():
+            update_menu()
+            window.destroy()
+
+    tk.Button(window, text="Add Category", command=save_category_action).grid(row=2, column=1, padx=10, pady=10, sticky="e")
+    window.columnconfigure(1, weight=1)
+
+
+def add_bookmark_window():
+    window = Toplevel(root)
+    safe_iconbitmap(window)
+    window.title("Add Bookmark")
+    position_child_window(window, 560, 190)
+
+    tk.Label(window, text="Category (or None):").grid(row=0, column=0, padx=10, pady=8, sticky="w")
+    parent_var = tk.StringVar(window)
+    parent_menu = set_option_menu(parent_var, window, category_option_list(True), "None")
+    parent_menu.grid(row=0, column=1, padx=10, pady=8, sticky="ew")
+
+    tk.Label(window, text="Bookmark Name:").grid(row=1, column=0, padx=10, pady=8, sticky="w")
+    name_entry = tk.Entry(window)
+    name_entry.grid(row=1, column=1, padx=10, pady=8, sticky="ew")
+
+    tk.Label(window, text="URL / Command:").grid(row=2, column=0, padx=10, pady=8, sticky="w")
+    link_entry = tk.Entry(window)
+    link_entry.grid(row=2, column=1, padx=10, pady=8, sticky="ew")
+
+    name_entry.focus_set()
+
+    def save_bookmark_action():
+        name = name_entry.get().strip()
+        link = link_entry.get().strip()
+        if not name or not link:
+            messagebox.showwarning("Invalid Input", "Both bookmark name and URL/command are required.")
+            return
+
+        selected_parent = parent_var.get()
+        if selected_parent == "None":
+            target_bm = bookmarks
+            target_usage = usage
+        else:
+            parent_path = tuple(selected_parent.split(" > "))
+            target_bm = get_node_by_path(bookmarks, parent_path)
+            target_usage = get_node_by_path(usage, parent_path)
+            if not isinstance(target_bm, dict) or not isinstance(target_usage, dict):
+                messagebox.showerror("Add Error", "Selected category is invalid.")
+                return
+
+        if name in target_bm:
+            messagebox.showwarning("Exists", "An item with that name already exists there.")
+            return
+
+        target_bm[name] = link
+        target_usage[name] = {"count": 0, "last_browser": None}
+
+        if save_bookmarks() and save_usage():
+            update_menu()
+            window.destroy()
+
+    tk.Button(window, text="Add Bookmark", command=save_bookmark_action).grid(row=3, column=1, padx=10, pady=10, sticky="e")
+    window.columnconfigure(1, weight=1)
+
+
+def delete_bookmark_window():
+    bookmark_items = get_all_bookmark_paths()
+    if not bookmark_items:
+        messagebox.showwarning("No Bookmarks", "There are no bookmarks to delete.")
+        return
+
+    window = Toplevel(root)
+    safe_iconbitmap(window)
+    window.title("Delete Bookmark")
+    position_child_window(window, 500, 130)
+
+    tk.Label(window, text="Select Bookmark:").grid(row=0, column=0, padx=10, pady=8, sticky="w")
+    options = [display for display, _ in bookmark_items]
+    selected_var = tk.StringVar(window)
+    option_menu = set_option_menu(selected_var, window, options, options[0])
+    option_menu.grid(row=0, column=1, padx=10, pady=8, sticky="ew")
+
+    def delete_action():
+        chosen = selected_var.get()
+        selected_path = next((path for display, path in bookmark_items if display == chosen), None)
+        if selected_path is None:
+            return
+        delete_node_by_path(bookmarks, selected_path)
+        delete_node_by_path(usage, selected_path)
+        if save_bookmarks() and save_usage():
+            update_menu()
+            window.destroy()
+
+    tk.Button(window, text="Delete", command=delete_action).grid(row=1, column=1, padx=10, pady=10, sticky="e")
+    window.columnconfigure(1, weight=1)
+
+
+def delete_category_window():
+    categories = get_all_category_paths()
+    if not categories:
+        messagebox.showwarning("No Categories", "There are no categories to delete.")
+        return
+
+    window = Toplevel(root)
+    safe_iconbitmap(window)
+    window.title("Delete Category")
+    position_child_window(window, 500, 130)
+
+    tk.Label(window, text="Select Category:").grid(row=0, column=0, padx=10, pady=8, sticky="w")
+    options = [path_to_label(path) for path in categories]
+    selected_var = tk.StringVar(window)
+    option_menu = set_option_menu(selected_var, window, options, options[0])
+    option_menu.grid(row=0, column=1, padx=10, pady=8, sticky="ew")
+
+    def delete_action():
+        path = tuple(selected_var.get().split(" > "))
+        delete_node_by_path(bookmarks, path)
+        delete_node_by_path(usage, path)
+        if save_bookmarks() and save_usage():
+            update_menu()
+            window.destroy()
+
+    tk.Button(window, text="Delete Category", command=delete_action).grid(row=1, column=1, padx=10, pady=10, sticky="e")
+    window.columnconfigure(1, weight=1)
+
+
+def edit_bookmark_window():
+    bookmark_items = get_all_bookmark_paths()
+    if not bookmark_items:
+        messagebox.showwarning("No Bookmarks", "There are no bookmarks to edit.")
+        return
+
+    selector = Toplevel(root)
+    safe_iconbitmap(selector)
+    selector.title("Select Bookmark to Edit")
+    position_child_window(selector, 520, 130)
+
+    tk.Label(selector, text="Select Bookmark:").grid(row=0, column=0, padx=10, pady=8, sticky="w")
+    options = [display for display, _ in bookmark_items]
+    selected_var = tk.StringVar(selector)
+    option_menu = set_option_menu(selected_var, selector, options, options[0])
+    option_menu.grid(row=0, column=1, padx=10, pady=8, sticky="ew")
+
+    def open_editor():
+        selected_path = next((path for display, path in bookmark_items if display == selected_var.get()), None)
+        if selected_path is None:
+            return
+
+        current_link = get_bookmark_link(selected_path)
+        current_name = selected_path[-1]
+        current_category = path_to_label(selected_path[:-1]) if len(selected_path) > 1 else "None"
+
+        editor = Toplevel(root)
+        safe_iconbitmap(editor)
+        editor.title("Edit Bookmark")
+        position_child_window(editor, 560, 220)
+
+        tk.Label(editor, text="Category (or None):").grid(row=0, column=0, padx=10, pady=8, sticky="w")
+        parent_var = tk.StringVar(editor)
+        parent_options = category_option_list(True)
+        parent_menu = set_option_menu(
+            parent_var,
+            editor,
+            parent_options,
+            current_category if current_category in parent_options else "None",
+        )
+        parent_menu.grid(row=0, column=1, padx=10, pady=8, sticky="ew")
+
+        tk.Label(editor, text="Bookmark Name:").grid(row=1, column=0, padx=10, pady=8, sticky="w")
+        name_entry = tk.Entry(editor)
+        name_entry.insert(0, current_name)
+        name_entry.grid(row=1, column=1, padx=10, pady=8, sticky="ew")
+
+        tk.Label(editor, text="URL / Command:").grid(row=2, column=0, padx=10, pady=8, sticky="w")
+        link_entry = tk.Entry(editor)
+        link_entry.insert(0, current_link or "")
+        link_entry.grid(row=2, column=1, padx=10, pady=8, sticky="ew")
+
+        def save_action():
+            new_name = name_entry.get().strip()
+            new_link = link_entry.get().strip()
+            if not new_name or not new_link:
+                messagebox.showwarning("Invalid Input", "Both name and URL/command are required.")
+                return
+
+            selected_parent = parent_var.get()
+            new_parent_path = () if selected_parent == "None" else tuple(selected_parent.split(" > "))
+            target_bm = bookmarks if not new_parent_path else get_node_by_path(bookmarks, new_parent_path)
+            target_usage = usage if not new_parent_path else get_node_by_path(usage, new_parent_path)
+            if not isinstance(target_bm, dict) or not isinstance(target_usage, dict):
+                messagebox.showerror("Edit Error", "Selected destination category is invalid.")
+                return
+
+            old_parent_bm = get_parent_dict(bookmarks, selected_path)
+            old_parent_usage = get_parent_dict(usage, selected_path)
+            old_usage_entry = deepcopy(old_parent_usage.get(selected_path[-1], {"count": 0, "last_browser": None}))
+            old_value = old_parent_bm.get(selected_path[-1])
+
+            same_target = selected_path[:-1] == new_parent_path and selected_path[-1] == new_name
+            if not same_target and new_name in target_bm:
+                messagebox.showwarning("Exists", "A bookmark with that name already exists in the destination category.")
+                return
+
+            del old_parent_bm[selected_path[-1]]
+            old_parent_usage.pop(selected_path[-1], None)
+
+            target_bm[new_name] = new_link
+            target_usage[new_name] = old_usage_entry
+
+            if save_bookmarks() and save_usage():
+                update_menu()
+                editor.destroy()
+                selector.destroy()
             else:
-                uentry = usage_dict.get(k, {"count": 0})
-                text.insert(tk.END, f"   {new_prefix} - usage: {uentry['count']}\n")
+                target_bm.pop(new_name, None)
+                target_usage.pop(new_name, None)
+                old_parent_bm[selected_path[-1]] = old_value
+                old_parent_usage[selected_path[-1]] = old_usage_entry
 
-    recurse_stats(bookmarks, usage)
-    text.config(state="disabled")
+        tk.Button(editor, text="Save Changes", command=save_action).grid(row=3, column=1, padx=10, pady=10, sticky="e")
+        editor.columnconfigure(1, weight=1)
 
+    tk.Button(selector, text="Edit", command=open_editor).grid(row=1, column=1, padx=10, pady=10, sticky="e")
+    selector.columnconfigure(1, weight=1)
+
+
+def edit_category_window():
+    categories = get_all_category_paths()
+    if not categories:
+        messagebox.showwarning("No Categories", "There are no categories to edit.")
+        return
+
+    selector = Toplevel(root)
+    safe_iconbitmap(selector)
+    selector.title("Edit Category")
+    position_child_window(selector, 500, 130)
+
+    tk.Label(selector, text="Select Category:").grid(row=0, column=0, padx=10, pady=8, sticky="w")
+    options = [path_to_label(path) for path in categories]
+    selected_var = tk.StringVar(selector)
+    option_menu = set_option_menu(selected_var, selector, options, options[0])
+    option_menu.grid(row=0, column=1, padx=10, pady=8, sticky="ew")
+
+    def open_editor():
+        path = tuple(selected_var.get().split(" > "))
+        current_name = path[-1]
+
+        editor = Toplevel(root)
+        safe_iconbitmap(editor)
+        editor.title("Rename Category")
+        position_child_window(editor, 420, 130)
+
+        tk.Label(editor, text="New Category Name:").grid(row=0, column=0, padx=10, pady=8, sticky="w")
+        name_entry = tk.Entry(editor)
+        name_entry.insert(0, current_name)
+        name_entry.grid(row=0, column=1, padx=10, pady=8, sticky="ew")
+
+        def save_action():
+            new_name = name_entry.get().strip()
+            if not new_name:
+                messagebox.showwarning("Invalid Input", "Category name is required.")
+                return
+
+            parent_bm = bookmarks if len(path) == 1 else get_node_by_path(bookmarks, path[:-1])
+            parent_usage = usage if len(path) == 1 else get_node_by_path(usage, path[:-1])
+
+            if new_name != current_name and new_name in parent_bm:
+                messagebox.showwarning("Exists", "A category or bookmark with that name already exists at this level.")
+                return
+
+            parent_bm[new_name] = parent_bm.pop(current_name)
+            parent_usage[new_name] = parent_usage.pop(current_name, {})
+
+            if save_bookmarks() and save_usage():
+                update_menu()
+                editor.destroy()
+                selector.destroy()
+
+        tk.Button(editor, text="Save Changes", command=save_action).grid(row=1, column=1, padx=10, pady=10, sticky="e")
+        editor.columnconfigure(1, weight=1)
+
+    tk.Button(selector, text="Edit", command=open_editor).grid(row=1, column=1, padx=10, pady=10, sticky="e")
+    selector.columnconfigure(1, weight=1)
+
+
+def move_item_window():
+    movable_items = []
+    for display, path in get_all_bookmark_paths():
+        movable_items.append((f"Bookmark: {display}", "bookmark", path))
+    for path in get_all_category_paths():
+        movable_items.append((f"Category: {path_to_label(path)}", "category", path))
+
+    if not movable_items:
+        messagebox.showwarning("No Items", "There are no bookmarks or categories to move.")
+        return
+
+    window = Toplevel(root)
+    safe_iconbitmap(window)
+    window.title("Move Bookmark / Category")
+    position_child_window(window, 640, 160)
+
+    item_map = {label: (node_type, path) for label, node_type, path in movable_items}
+
+    tk.Label(window, text="Select item to move:").grid(row=0, column=0, padx=10, pady=8, sticky="w")
+    item_var = tk.StringVar(window)
+    item_options = list(item_map.keys())
+    item_menu = set_option_menu(item_var, window, item_options, item_options[0])
+    item_menu.grid(row=0, column=1, padx=10, pady=8, sticky="ew")
+
+    tk.Label(window, text="Destination category (or None):").grid(row=1, column=0, padx=10, pady=8, sticky="w")
+    dest_var = tk.StringVar(window)
+    dest_menu = set_option_menu(dest_var, window, category_option_list(True), "None")
+    dest_menu.grid(row=1, column=1, padx=10, pady=8, sticky="ew")
+
+    def move_action():
+        selected_item = item_var.get()
+        item_type, old_path = item_map[selected_item]
+        destination = dest_var.get()
+        new_parent_path = () if destination == "None" else tuple(destination.split(" > "))
+
+        if item_type == "category":
+            if new_parent_path == old_path or is_descendant_path(old_path, new_parent_path):
+                messagebox.showerror("Move Error", "You cannot move a category into itself or one of its subcategories.")
+                return
+
+        if item_type == "bookmark" and old_path[:-1] == new_parent_path:
+            window.destroy()
+            return
+        if item_type == "category" and old_path[:-1] == new_parent_path:
+            window.destroy()
+            return
+
+        target_bm = bookmarks if not new_parent_path else get_node_by_path(bookmarks, new_parent_path)
+        target_usage = usage if not new_parent_path else get_node_by_path(usage, new_parent_path)
+        if not isinstance(target_bm, dict) or not isinstance(target_usage, dict):
+            messagebox.showerror("Move Error", "Destination category is invalid.")
+            return
+
+        source_parent_bm = get_parent_dict(bookmarks, old_path)
+        source_parent_usage = get_parent_dict(usage, old_path)
+        name = old_path[-1]
+
+        if name in target_bm:
+            messagebox.showerror("Move Error", f"An item named '{name}' already exists in the destination.")
+            return
+
+        target_bm[name] = source_parent_bm.pop(name)
+        target_usage[name] = source_parent_usage.pop(
+            name,
+            {} if item_type == "category" else {"count": 0, "last_browser": None},
+        )
+
+        if save_bookmarks() and save_usage():
+            update_menu()
+            window.destroy()
+
+    tk.Button(window, text="Move", command=move_action).grid(row=2, column=1, padx=10, pady=10, sticky="e")
+    window.columnconfigure(1, weight=1)
+
+
+# -----------------------------
+# Manage / reorder window
+# -----------------------------
 def manage_bookmarks_window():
-    mgr_win = Toplevel(root)
-    mgr_win.iconbitmap(icon_path)
-    mgr_win.title("Manage Bookmarks")
-    mgr_win.geometry("500x400+" + str(root.winfo_x() + 50) + "+" + str(root.winfo_y() + 50))
+    window = Toplevel(root)
+    safe_iconbitmap(window)
+    window.title("Manage Bookmarks")
+    position_child_window(window, 680, 450)
 
-    tree = ttk.Treeview(mgr_win)
+    tree = ttk.Treeview(window, columns=("node_type", "path"), show="tree")
     tree.pack(fill="both", expand=True, side="left")
 
-    btn_frame = tk.Frame(mgr_win)
-    btn_frame.pack(side="right", fill="y")
+    button_frame = tk.Frame(window)
+    button_frame.pack(side="right", fill="y", padx=6, pady=6)
 
-    def populate_tree(parent, data, path=()):
-        for k, v in data.items():
-            node_id = tree.insert(parent, "end", text=k, values=[*path, k])
-            if isinstance(v, dict):
-                populate_tree(node_id, v, path + (k,))
+    original_links = {path: get_bookmark_link(path) for _, path in get_all_bookmark_paths()}
 
-    populate_tree("", bookmarks)
+    def populate(parent_id, data, current_path=()):
+        for key, value in data.items():
+            path = current_path + (key,)
+            node_type = "category" if isinstance(value, dict) else "bookmark"
+            item_id = tree.insert(parent_id, "end", text=key, values=(node_type, path_to_label(path)))
+            if isinstance(value, dict):
+                populate(item_id, value, path)
 
-    def move_item_up():
-        sel = tree.selection()
-        if not sel:
+    populate("", bookmarks)
+
+    def move_selected(direction: int):
+        selection = tree.selection()
+        if not selection:
             return
-        item = sel[0]
-        parent = tree.parent(item)
-        index = tree.index(item)
-        if index > 0:
-            tree.move(item, parent, index-1)
-
-    def move_item_down():
-        sel = tree.selection()
-        if not sel:
+        item_id = selection[0]
+        parent_id = tree.parent(item_id)
+        index = tree.index(item_id)
+        new_index = index + direction
+        if new_index < 0:
             return
-        item = sel[0]
-        parent = tree.parent(item)
-        index = tree.index(item)
-        tree.move(item, parent, index+1)
+        sibling_count = len(tree.get_children(parent_id))
+        if new_index >= sibling_count:
+            return
+        tree.move(item_id, parent_id, new_index)
 
-    all_bms = get_all_bookmark_paths(load_bookmarks())
-    path_link_map = {}
-    for _, p in all_bms:
-        link = get_bookmark_by_path(bookmarks, p)
-        path_link_map[p] = link
+    def rebuild_node(item_id):
+        item = tree.item(item_id)
+        name = item["text"]
+        values = item.get("values", [])
+        node_type = values[0] if values else "bookmark"
 
-    def rebuild_data():
-        def traverse(node_id):
-            children = tree.get_children(node_id)
-            if not children:
-                text_val = tree.item(node_id, "text")
-                return text_val
-            else:
-                cat_dict = {}
-                for c in children:
-                    sub_result = traverse(c)
-                    child_text = tree.item(c, "text")
-                    if isinstance(sub_result, dict):
-                        cat_dict[child_text] = sub_result
-                    elif isinstance(sub_result, str):
-                        cat_dict[child_text] = bookmarks_lookup(child_text, c)
-                return cat_dict
+        if node_type == "bookmark":
+            original_path_label = values[1] if len(values) > 1 else name
+            original_path = tuple(original_path_label.split(" > ")) if original_path_label else (name,)
+            return name, original_links.get(original_path, "")
 
-        def bookmarks_lookup(text_val, node_id):
-            full_path = tree.item(node_id, "values")
-            full_path = tuple(full_path)
-            return path_link_map.get(full_path, "")
-
-        new_data = {}
-        for top_item in tree.get_children(""):
-            res = traverse(top_item)
-            cat_name = tree.item(top_item, "text")
-            if isinstance(res, dict):
-                new_data[cat_name] = res
-            else:
-                new_data[cat_name] = bookmarks_lookup(cat_name, top_item)
-        return new_data
+        category_data = {}
+        for child_id in tree.get_children(item_id):
+            child_name, child_value = rebuild_node(child_id)
+            category_data[child_name] = child_value
+        return name, category_data
 
     def save_reorder():
-        new_bm = rebuild_data()
+        new_tree = {}
+        for top_item in tree.get_children(""):
+            name, value = rebuild_node(top_item)
+            new_tree[name] = value
+
         bookmarks.clear()
-        bookmarks.update(new_bm)
-        save_bookmarks()
+        bookmarks.update(new_tree)
         sync_usage_structure(bookmarks, usage)
-        save_usage()
-        update_menu()
-        mgr_win.destroy()
 
-    Button(btn_frame, text="Move Up", command=move_item_up).pack(pady=5)
-    Button(btn_frame, text="Move Down", command=move_item_down).pack(pady=5)
-    Button(btn_frame, text="Save Changes", command=save_reorder).pack(pady=5)
+        if save_bookmarks() and save_usage():
+            update_menu()
+            window.destroy()
 
+    tk.Button(button_frame, text="Move Up", command=lambda: move_selected(-1)).pack(fill="x", pady=4)
+    tk.Button(button_frame, text="Move Down", command=lambda: move_selected(1)).pack(fill="x", pady=4)
+    tk.Button(button_frame, text="Save Changes", command=save_reorder).pack(fill="x", pady=8)
+
+
+# -----------------------------
+# Import / export / stats / search
+# -----------------------------
 def export_to_json():
-    filename = filedialog.asksaveasfilename(defaultextension=".json",
-                                            filetypes=[("JSON files","*.json")])
-    if not filename:
-        return
-    with open(filename, "w", encoding="utf-8") as f:
-        json.dump(bookmarks, f, indent=4)
-    messagebox.showinfo("Export", "Bookmarks exported successfully.")
-
-def import_from_json():
-    filename = filedialog.askopenfilename(filetypes=[("JSON files","*.json")])
+    filename = filedialog.asksaveasfilename(
+        defaultextension=".json",
+        filetypes=[("JSON files", "*.json")]
+    )
     if not filename:
         return
     try:
-        with open(filename, "r", encoding="utf-8") as f:
-            imported = json.load(f)
-        def merge_dict(src, dest):
-            for k, v in src.items():
-                if k not in dest:
-                    dest[k] = v
-                else:
-                    if isinstance(v, dict) and isinstance(dest[k], dict):
-                        merge_dict(v, dest[k])
-                    else:
-                        dest[k] = v
-        merge_dict(imported, bookmarks)
-        save_bookmarks()
-        sync_usage_structure(bookmarks, usage)
-        save_usage()
-        update_menu()
-        messagebox.showinfo("Import", "Bookmarks imported successfully.")
-    except Exception as e:
-        messagebox.showerror("Error", f"Failed to import: {e}")
+        with open(filename, "w", encoding="utf-8") as handle:
+            json.dump(bookmarks, handle, indent=4, ensure_ascii=False)
+        messagebox.showinfo("Export", "Bookmarks exported successfully.")
+    except OSError as exc:
+        messagebox.showerror("Export Error", f"Could not export bookmarks:\n{exc}")
 
-def search_bookmarks(query):
+
+def merge_bookmark_dict(source: dict, destination: dict):
+    for key, value in source.items():
+        if isinstance(value, dict) and isinstance(destination.get(key), dict):
+            merge_bookmark_dict(value, destination[key])
+        else:
+            destination[key] = deepcopy(value)
+
+
+def import_from_json():
+    filename = filedialog.askopenfilename(filetypes=[("JSON files", "*.json")])
+    if not filename:
+        return
+
+    try:
+        with open(filename, "r", encoding="utf-8") as handle:
+            imported = json.load(handle)
+        if not isinstance(imported, dict):
+            raise ValueError("Imported JSON must contain an object at the top level.")
+        imported = normalize_bookmark_tree(imported)
+        merge_bookmark_dict(imported, bookmarks)
+        sync_usage_structure(bookmarks, usage)
+        if save_bookmarks() and save_usage():
+            update_menu()
+            messagebox.showinfo("Import", "Bookmarks imported successfully.")
+    except Exception as exc:
+        messagebox.showerror("Import Error", f"Failed to import bookmarks:\n{exc}")
+
+
+def show_usage_stats():
+    window = Toplevel(root)
+    safe_iconbitmap(window)
+    window.title("Usage Statistics")
+    position_child_window(window, 500, 360)
+
+    text = tk.Text(window, wrap="none")
+    text.pack(fill="both", expand=True)
+
+    def write_stats(bookmark_node, usage_node, prefix=""):
+        for key, value in bookmark_node.items():
+            current_label = f"{prefix}{key}"
+            if isinstance(value, dict):
+                total = sum_all_usage(usage_node.get(key, {})) if isinstance(usage_node, dict) else 0
+                text.insert(tk.END, f"[Category] {current_label} - total usage: {total}\n")
+                write_stats(value, usage_node.get(key, {}) if isinstance(usage_node, dict) else {}, current_label + " > ")
+            else:
+                entry = usage_node.get(key, {}) if isinstance(usage_node, dict) else {}
+                text.insert(tk.END, f"    {current_label} - usage: {int(entry.get('count', 0) or 0)}\n")
+
+    write_stats(bookmarks, usage)
+    text.config(state="disabled")
+
+
+def search_bookmarks(query: str):
     query = query.strip().lower()
     if not query:
-        messagebox.showinfo("Search", "Please enter text to search.")
         return
-    all_bms = get_all_bookmark_paths(bookmarks)
-    matches = [(display, path) for display, path in all_bms if query in display.lower()]
+
+    matches = [
+        (display, path)
+        for display, path in get_all_bookmark_paths()
+        if query in display.lower()
+    ]
+
     if not matches:
         messagebox.showinfo("Search", f"No bookmarks found for '{query}'.")
         return
+
     popup = Menu(root, tearoff=0)
     for display, path in matches:
-        def open_found(p=path):
-            link = get_bookmark_by_path(bookmarks, p)
-            record_usage_and_open(link, p)
-        popup.add_command(label=display, command=open_found)
-    x = search_button.winfo_rootx()
-    y = search_button.winfo_rooty() + search_button.winfo_height()
-    popup.post(x, y)
+        popup.add_command(
+            label=display,
+            command=lambda chosen_path=path: record_usage_and_open(
+                get_bookmark_link(chosen_path), chosen_path
+            )
+        )
 
+    popup.post(
+        search_button.winfo_rootx(),
+        search_button.winfo_rooty() + search_button.winfo_height()
+    )
+
+
+# -----------------------------
+# App lifecycle
+# -----------------------------
 def show_context_menu(event):
     context_menu.post(event.x_root, event.y_root)
 
-def load_geometry():
-    if os.path.exists(GEOMETRY_FILE):
-        with open(GEOMETRY_FILE, "r", encoding="utf-8") as f:
-            return f.read().strip()
-    return None
 
-def save_geometry(geometry):
-    with open(GEOMETRY_FILE, "w", encoding="utf-8") as f:
-        f.write(geometry)
+def force_compact_height():
+    root.update_idletasks()
+    width = root.winfo_width()
+    x = root.winfo_x()
+    y = root.winfo_y()
+    root.geometry(f"{width}x{FIXED_HEIGHT}+{x}+{y}")
+    root.minsize(MIN_WIDTH, FIXED_HEIGHT)
+    root.maxsize(10000, FIXED_HEIGHT)
+
 
 def on_closing():
     root.update_idletasks()
-    geom = root.winfo_geometry()
-    m = re.match(r"(\d+)x(\d+)\+(\d+)\+(\d+)", geom)
-    if m:
-        width, height, x, y = map(int, m.groups())
-        height += 20
-        geom = f"{width}x{height}+{x}+{y}"
-    save_geometry(geom)
+    width = root.winfo_width()
+    x = root.winfo_x()
+    y = root.winfo_y()
+    save_geometry(f"{width}x{FIXED_HEIGHT}+{x}+{y}")
     root.destroy()
 
-def main():
-    global root, menu, bookmarks, usage
+
+def set_sort_mode(mode: str):
+    global sort_mode
+    sort_mode = mode
+    update_menu()
+
+
+def do_search():
+    search_bookmarks(search_var.get())
+    search_var.set("")
+
+
+def build_ui():
+    global menu, extra_menu, sort_menu, context_menu
     global browser_var, search_var, search_entry, search_button
-    global extra_menu, sort_menu, context_menu, icon_path
-
-    root = tk.Tk()
-    root.title("Bookmarks Manager")
-
-    saved_geom = load_geometry()
-    if saved_geom:
-        root.geometry(saved_geom)
-    else:
-        root.geometry("600x200")
-    root.minsize(600, 40)
-
-    # --- FIX ICON PATH HERE ---
-    PROJECT_PATH = os.path.dirname(os.path.abspath(__file__))
-    icon_path = os.path.join(PROJECT_PATH, "it4home.ico")
-    if os.path.exists(icon_path):
-        try:
-            root.iconbitmap(icon_path)
-        except Exception:
-            pass
 
     menu = Menu(root)
     root.config(menu=menu)
@@ -894,12 +1038,8 @@ def main():
     extra_menu.add_command(label="Usage Stats", command=show_usage_stats)
 
     sort_menu = Menu(menu, tearoff=0)
-    def set_sort_mode(mode):
-        global sort_mode
-        sort_mode = mode
-        update_menu()
-    sort_menu.add_command(label="Sort by Usage", command=lambda: set_sort_mode("usage"))
-    sort_menu.add_command(label="Sort by Name",  command=lambda: set_sort_mode("name"))
+    sort_menu.add_command(label="Sort by Usage", command=lambda: set_sort_mode(SORT_BY_USAGE))
+    sort_menu.add_command(label="Sort by Name", command=lambda: set_sort_mode(SORT_BY_NAME))
 
     context_menu = Menu(root, tearoff=0)
     context_menu.add_command(label="Add Bookmark", command=add_bookmark_window)
@@ -908,40 +1048,62 @@ def main():
     context_menu.add_command(label="Edit Category", command=edit_category_window)
     context_menu.add_command(label="Delete Bookmark", command=delete_bookmark_window)
     context_menu.add_command(label="Delete Category", command=delete_category_window)
-    context_menu.add_command(label="Move Bookmark/Category", command=move_item_window)
+    context_menu.add_command(label="Move Bookmark / Category", command=move_item_window)
+
     root.bind("<Button-3>", show_context_menu)
 
-    browser_var = StringVar(root)
-    browser_var.set("LastUsed")
-    browser_frame = tk.Frame(root)
-    browser_frame.pack(side="bottom", fill="x")
+    content_frame = tk.Frame(root)
+    content_frame.pack(side="top", fill="x", padx=8, pady=2)
 
-    browser_label = tk.Label(browser_frame, text="Browser:")
-    browser_label.pack(side="left", padx=(10, 2), pady=5)
-    browser_menu = OptionMenu(browser_frame, browser_var, "LastUsed", "Edge", "Firefox", "Chrome", "Default")
-    browser_menu.pack(side="left", pady=5)
+    tk.Label(content_frame, text="Browser:").grid(row=0, column=0, padx=(0, 4), pady=0, sticky="w")
 
-    search_var = StringVar()
-    search_var.trace("w", update_suggestions)
-    search_entry = tk.Entry(browser_frame, textvariable=search_var, width=20)
-    search_entry.pack(side="left", padx=(10, 2), pady=5)
-    search_button = tk.Button(browser_frame, text="Search",
-                              command=lambda: (search_bookmarks(search_var.get()), search_var.set("")))
-    search_button.pack(side="left", padx=5, pady=5)
+    browser_var = tk.StringVar(root, value="LastUsed")
+    browser_menu = tk.OptionMenu(content_frame, browser_var, *BROWSERS)
+    browser_menu.config(width=8, padx=2, pady=0, highlightthickness=0)
+    browser_menu.grid(row=0, column=1, padx=(0, 10), pady=0, sticky="w")
 
-    info_label = tk.Label(browser_frame, text="\u0040Knud Schr\u00F8der (it4home.dk)", fg="gray")
-    info_label.pack(side="right", padx=(2, 10), pady=5)
+    search_var = tk.StringVar()
+    search_entry = tk.Entry(content_frame, textvariable=search_var, width=18)
+    search_entry.grid(row=0, column=2, padx=(0, 4), pady=0, ipady=0, sticky="w")
+    search_entry.bind("<Return>", lambda event: do_search())
 
-    global bookmarks
+    search_button = tk.Button(content_frame, text="Search", command=do_search, padx=4, pady=0)
+    search_button.grid(row=0, column=3, padx=(0, 8), pady=0, ipadx=0, ipady=0, sticky="w")
+
+    tk.Label(
+        content_frame,
+        text="@Knud Schroder",
+        fg="gray"
+    ).grid(row=0, column=4, padx=(8, 0), pady=0, sticky="e")
+
+    content_frame.columnconfigure(4, weight=1)
+
+
+def main():
+    global root, bookmarks, usage, icon_path
+
+    root = tk.Tk()
+    root.title(APP_TITLE)
+
+    saved_geometry = load_geometry()
+    root.geometry(saved_geometry if saved_geometry else DEFAULT_GEOMETRY)
+    root.minsize(MIN_WIDTH, FIXED_HEIGHT)
+
+    icon_path = os.path.join(APP_DIR, "bookmark.ico")
+    safe_iconbitmap(root)
+
+    build_ui()
+
     bookmarks = load_bookmarks()
-    global usage
-    usage = load_usage()
-    usage = sync_usage_structure(bookmarks, usage)
+    usage = sync_usage_structure(bookmarks, load_usage())
     save_usage()
     update_menu()
+
+    force_compact_height()
 
     root.protocol("WM_DELETE_WINDOW", on_closing)
     root.mainloop()
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     main()
